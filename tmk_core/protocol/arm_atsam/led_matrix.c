@@ -257,6 +257,68 @@ uint8_t led_lighting_mode;
 issi3733_led_t *led_cur;
 uint8_t led_per_run = 15;
 float breathe_mult;
+float pomod;
+
+void led_run_pattern(led_setup_t *f, float* ro, float* go, float* bo, float pos) {
+    float po;
+
+    while (f->end != 1)
+    {
+        po = pos; //Reset po for new frame
+
+        //Add in any moving effects
+        if ((!led_animation_direction && f->ef & EF_SCR_R) || (led_animation_direction && (f->ef & EF_SCR_L)))
+        {
+            po -= pomod;
+
+            if (po > 100) po -= 100;
+            else if (po < 0) po += 100;
+        }
+        else if ((!led_animation_direction && f->ef & EF_SCR_L) || (led_animation_direction && (f->ef & EF_SCR_R)))
+        {
+            po += pomod;
+
+            if (po > 100) po -= 100;
+            else if (po < 0) po += 100;
+        }
+
+        //Check if LED's po is in current frame
+        if (po < f->hs) { f++; continue; }
+        if (po > f->he) { f++; continue; }
+        //note: < 0 or > 100 continue
+
+        //Calculate the po within the start-stop percentage for color blending
+        po = (po - f->hs) / (f->he - f->hs);
+
+        //Add in any color effects
+        if (f->ef & EF_OVER)
+        {
+            *ro = (po * (f->re - f->rs)) + f->rs;// + 0.5;
+            *go = (po * (f->ge - f->gs)) + f->gs;// + 0.5;
+            *bo = (po * (f->be - f->bs)) + f->bs;// + 0.5;
+        }
+        else if (f->ef & EF_SUBTRACT)
+        {
+            *ro -= (po * (f->re - f->rs)) + f->rs;// + 0.5;
+            *go -= (po * (f->ge - f->gs)) + f->gs;// + 0.5;
+            *bo -= (po * (f->be - f->bs)) + f->bs;// + 0.5;
+        }
+        else
+        {
+            *ro += (po * (f->re - f->rs)) + f->rs;// + 0.5;
+            *go += (po * (f->ge - f->gs)) + f->gs;// + 0.5;
+            *bo += (po * (f->be - f->bs)) + f->bs;// + 0.5;
+        }
+
+        f++;
+    }
+}
+
+__attribute__((weak))
+led_instruction_t led_instructions[] = { { .end = 1 } };
+
+uint8_t highest_active_layer = 0;
+uint32_t temp_layer_state = 0;
 
 __attribute__ ((weak))
 void led_matrix_run(void)
@@ -278,6 +340,7 @@ void led_matrix_run(void)
 
         if (led_animation_breathing)
         {
+            //+60us 119 LED
             led_animation_breathe_cur += breathe_step * breathe_dir;
 
             if (led_animation_breathe_cur >= BREATHE_MAX_STEP)
@@ -290,24 +353,36 @@ void led_matrix_run(void)
             if (breathe_mult > 1) breathe_mult = 1;
             else if (breathe_mult < 0) breathe_mult = 0;
         }
+
+        //Only needs to be calculated once per frame
+        pomod = (float)(disp.frame % (uint32_t)(1000.0f / led_animation_speed)) / 10.0f * led_animation_speed;
+        pomod *= 100.0f;
+        pomod = (uint32_t)pomod % 10000;
+        pomod /= 100.0f;
+
+        highest_active_layer = 0;
+        temp_layer_state = layer_state;
+
+        while (temp_layer_state >> 1 != 0) {
+            highest_active_layer++;
+            temp_layer_state = temp_layer_state >> 1;
+        }
     }
-
-    uint8_t fcur = 0;
-    uint8_t fmax = 0;
-
-    //Frames setup
-    while (f[fcur].end != 1)
-    {
-        fcur++; //Count frames
-    }
-
-    fmax = fcur; //Store total frames count
 
     while (led_cur < lede && led_this_run < led_per_run)
     {
         ro = 0;
         go = 0;
         bo = 0;
+
+        if (led_animation_orientation)
+        {
+            po = led_cur->py;
+        }
+        else
+        {
+            po = led_cur->px;
+        }
 
         if (led_lighting_mode == LED_MODE_KEYS_ONLY && led_cur->scan == 255)
         {
@@ -323,71 +398,52 @@ void led_matrix_run(void)
         }
         else
         {
+            led_instruction_t *led_cur_instruction;
+            led_cur_instruction = led_instructions;
+
             //Act on LED
-            for (fcur = 0; fcur < fmax; fcur++)
-            {
+            if (led_cur_instruction->end) {
+                // If no instructions, use normal pattern
+                led_run_pattern(f, &ro, &go, &bo, po);
+            } else {
+                uint8_t skip;
+                uint8_t modid = (led_cur->id - 1) / 32;                         //PS: Calculate which id# contains the led bit
+                uint32_t modidbit = 1 << ((led_cur->id - 1) % 32);              //PS: Calculate the bit within the id#
+                uint32_t *bitfield;                                             //PS: Will point to the id# within the current instruction
 
-                if (led_animation_orientation)
-                {
-                  po = led_cur->py;
-                }
-                else
-                {
-                  po = led_cur->px;
-                }
+                while (!led_cur_instruction->end) {
+                    skip = 0;
 
-                float pomod;
-                pomod = (float)(disp.frame % (uint32_t)(1000.0f / led_animation_speed)) / 10.0f * led_animation_speed;
+                    //PS: Check layer active first
+                    if (led_cur_instruction->flags & LED_FLAG_MATCH_LAYER) {
+                        if (led_cur_instruction->layer != highest_active_layer) {
+                            skip = 1;
+                        }
+                    }
 
-                //Add in any moving effects
-                if ((!led_animation_direction && f[fcur].ef & EF_SCR_R) || (led_animation_direction && (f[fcur].ef & EF_SCR_L)))
-                {
-                    pomod *= 100.0f;
-                    pomod = (uint32_t)pomod % 10000;
-                    pomod /= 100.0f;
+                    if (!skip)
+                    {
+                        if (led_cur_instruction->flags & LED_FLAG_MATCH_ID) {
+                            bitfield = &led_cur_instruction->id0 + modid;       //PS: Add modid as offset to id0 address. *bitfield is now idX of the led id
+                            if (~(*bitfield) & modidbit) {                      //PS: Check if led bit is not set in idX
+                                skip = 1;
+                            }
+                        }
+                    }
 
-                    po -= pomod;
+                    if (!skip) {
+                        if (led_cur_instruction->flags & LED_FLAG_USE_RGB) {
+                            ro = led_cur_instruction->r;
+                            go = led_cur_instruction->g;
+                            bo = led_cur_instruction->b;
+                        } else if (led_cur_instruction->flags & LED_FLAG_USE_PATTERN) {
+                            led_run_pattern(led_setups[led_cur_instruction->pattern_id], &ro, &go, &bo, po);
+                        } else if (led_cur_instruction->flags & LED_FLAG_USE_ROTATE_PATTERN) {
+                            led_run_pattern(f, &ro, &go, &bo, po);
+                        }
+                    }
 
-                    if (po > 100) po -= 100;
-                    else if (po < 0) po += 100;
-                }
-                else if ((!led_animation_direction && f[fcur].ef & EF_SCR_L) || (led_animation_direction && (f[fcur].ef & EF_SCR_R)))
-                {
-                    pomod *= 100.0f;
-                    pomod = (uint32_t)pomod % 10000;
-                    pomod /= 100.0f;
-                    po += pomod;
-
-                    if (po > 100) po -= 100;
-                    else if (po < 0) po += 100;
-                }
-
-                //Check if LED's po is in current frame
-                if (po < f[fcur].hs) continue;
-                if (po > f[fcur].he) continue;
-                //note: < 0 or > 100 continue
-
-                //Calculate the po within the start-stop percentage for color blending
-                po = (po - f[fcur].hs) / (f[fcur].he - f[fcur].hs);
-
-                //Add in any color effects
-                if (f[fcur].ef & EF_OVER)
-                {
-                    ro = (po * (f[fcur].re - f[fcur].rs)) + f[fcur].rs;// + 0.5;
-                    go = (po * (f[fcur].ge - f[fcur].gs)) + f[fcur].gs;// + 0.5;
-                    bo = (po * (f[fcur].be - f[fcur].bs)) + f[fcur].bs;// + 0.5;
-                }
-                else if (f[fcur].ef & EF_SUBTRACT)
-                {
-                    ro -= (po * (f[fcur].re - f[fcur].rs)) + f[fcur].rs;// + 0.5;
-                    go -= (po * (f[fcur].ge - f[fcur].gs)) + f[fcur].gs;// + 0.5;
-                    bo -= (po * (f[fcur].be - f[fcur].bs)) + f[fcur].bs;// + 0.5;
-                }
-                else
-                {
-                    ro += (po * (f[fcur].re - f[fcur].rs)) + f[fcur].rs;// + 0.5;
-                    go += (po * (f[fcur].ge - f[fcur].gs)) + f[fcur].gs;// + 0.5;
-                    bo += (po * (f[fcur].be - f[fcur].bs)) + f[fcur].bs;// + 0.5;
+                    led_cur_instruction++;
                 }
             }
         }
